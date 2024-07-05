@@ -15,7 +15,7 @@ class GPTModel(nn.Module):
         self.n_heads = config["n_heads"]
         self.n_layers = config["n_layers"]
         self.drop_rate = config["drop_rate"]
-        self.window_size = config["window_size"]  # Added window_size
+        self.window_size = config["window_size"]  # Added window_size, TODO: use it :')
 
         self.token_embedding = nn.Embedding(self.vocab_size, self.emb_dim)
         self.pos_emb = nn.Parameter(torch.zeros(1, self.context_length, self.emb_dim))
@@ -24,7 +24,6 @@ class GPTModel(nn.Module):
             tb.TransformerBlock(
                 emb_dim=self.emb_dim, 
                 num_heads=self.n_heads,
-                window_size=self.window_size,  # Pass window_size
                 drop_rate=self.drop_rate
             ) for _ in range(self.n_layers)
         ])
@@ -73,7 +72,7 @@ class GPTModel(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
         return idx
     
-    def generate(self, idx, max_new_tokens, temperature=0.0, top_k=None, eos_id=None):
+    def generate(self, idx, max_new_tokens, temperature=0.0, top_k=None, top_p=None, eos_id=None):
         # For-loop is the same as before: Get logits, and only focus on last time step
         for _ in range(max_new_tokens):
             idx_cond = idx[:, -self.context_length:]
@@ -87,6 +86,22 @@ class GPTModel(nn.Module):
                 top_logits, _ = torch.topk(logits, top_k)
                 min_val = top_logits[:, -1]
                 logits = torch.where(logits < min_val, torch.tensor(float('-inf')).to(logits.device), logits)
+
+            if top_p is not None:
+                # Compute cumulative probabilities of sorted logits
+                sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+
+                # Compute cumulative probabilities
+                cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+
+                # Remove tokens with cumulative probability above the threshold
+                sorted_indices_to_remove = cumulative_probs > top_p
+
+                # Shift the indices to the right to keep also the first token above the threshold
+                sorted_indices_to_remove = torch.cat((torch.zeros_like(sorted_indices_to_remove[:, :1]), sorted_indices_to_remove[:, :-1]), dim=-1)
+
+                # Set the logits to -infinity for the tokens that should be removed
+                logits[sorted_indices_to_remove] = float('-inf')
 
             # New: Apply temperature scaling
             if temperature > 0.0:

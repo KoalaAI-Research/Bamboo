@@ -28,19 +28,17 @@ class GELU(nn.Module):
         ))
     
 class FeedForward(nn.Module):
-    def __init__(self, emb_dim, drop_rate):
-        super(FeedForward, self).__init__()
-        self.linear1 = nn.Linear(emb_dim, emb_dim * 4)
-        self.gelu = nn.GELU()
-        self.drop = nn.Dropout(drop_rate)
-        self.linear2 = nn.Linear(emb_dim * 4, emb_dim)
-    
+    def __init__(self, cfg):
+        super().__init__()
+        self.layers = nn.Sequential(
+            nn.Linear(cfg["emb_dim"], 4 * cfg["emb_dim"]),
+            GELU(),
+            nn.Linear(4 * cfg["emb_dim"], cfg["emb_dim"]),
+        )
+
     def forward(self, x):
-        x = self.linear1(x)
-        x = self.gelu(x)
-        x = self.drop(x)
-        x = self.linear2(x)
-        return x
+        return self.layers(x)
+
 
 class TransformerBlock(nn.Module):
     def __init__(self, cfg):
@@ -49,9 +47,10 @@ class TransformerBlock(nn.Module):
             d_in=cfg["emb_dim"],
             d_out=cfg["emb_dim"],
             context_length=cfg["context_length"],
-            num_heads=cfg["n_heads"], 
+            num_heads=cfg["n_heads"],
             dropout=cfg["drop_rate"],
-            qkv_bias=cfg["qkv_bias"])
+            qkv_bias=cfg["qkv_bias"]
+        )
         self.ff = FeedForward(cfg)
         self.norm1 = LayerNorm(cfg["emb_dim"])
         self.norm2 = LayerNorm(cfg["emb_dim"])
@@ -61,11 +60,11 @@ class TransformerBlock(nn.Module):
         # Shortcut connection for attention block
         shortcut = x
         x = self.norm1(x)
-        x = self.att(x)  # Shape [batch_size, num_tokens, emb_size]
+        x = self.att(x)   # Shape [batch_size, num_tokens, emb_size]
         x = self.drop_shortcut(x)
         x = x + shortcut  # Add the original input back
 
-        # Shortcut connection for feed forward block
+        # Shortcut connection for feed-forward block
         shortcut = x
         x = self.norm2(x)
         x = self.ff(x)
@@ -73,22 +72,3 @@ class TransformerBlock(nn.Module):
         x = x + shortcut  # Add the original input back
 
         return x
-    
-from architecture.multiheadattention import MultiHeadAttention
-import torch.utils.checkpoint as checkpoint
-
-class TransformerBlock(nn.Module):
-    def __init__(self, emb_dim, num_heads, window_size, drop_rate):
-        super(TransformerBlock, self).__init__()
-        self.attention = MultiHeadAttention(emb_dim, num_heads, window_size)
-        self.norm1 = LayerNorm(emb_dim)
-        self.norm2 = LayerNorm(emb_dim)
-        self.ffn = FeedForward(emb_dim, drop_rate)
-
-    def forward(self, x):
-        # Using checkpointing for attention and feedforward layers
-        x = checkpoint.checkpoint(self.attention, x)
-        x = self.norm1(x)
-        x = checkpoint.checkpoint(self.ffn, x)
-        out = self.norm2(x)
-        return out
