@@ -202,9 +202,11 @@ def main(gpt_config, settings, continue_training_from="", compile_model=True):
     if continue_training_from != "":
         print("Continuing training from a previous checkpoint...")
         checkpoint = torch.load(continue_training_from)
+        
         model = GPTModel(GPT_CONFIG_124M)
         model.load_state_dict(checkpoint["model_state_dict"])
-        optimizer = torch.optim.AdamW(model.parameters(), lr=0.0005, weight_decay=0.1)
+
+        optimizer = torch.optim.AdamW(model.parameters(), weight_decay=settings["weight_decay"])
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     else:
         print("Initializing model...")
@@ -221,7 +223,7 @@ def main(gpt_config, settings, continue_training_from="", compile_model=True):
                 print("Windows OS detected. Setting trinitron fallback to True.")
                 torch._dynamo.config.suppress_errors = True
         
-        optimizer = torch.optim.AdamW(model.parameters(), lr=settings["learning_rate"], weight_decay=settings["weight_decay"])
+        optimizer = torch.optim.AdamW(model.parameters(), weight_decay=settings["weight_decay"])
     
     print("Setting up dataloaders...")
     train_ratio = 0.90
@@ -252,20 +254,15 @@ def main(gpt_config, settings, continue_training_from="", compile_model=True):
     startDateTime = time.time()
     total_steps = len(train_loader) * settings["num_epochs"]
     warmup_steps = int(0.2 * total_steps)
-    eval_freq = 10
+    eval_freq = 5
     eval_iter = 1
     save_every = 99999
     
-    """train_losses, val_losses, tokens_seen, lrs = train_model(
+    train_losses, val_losses, tokens_seen, lrs = train_model(
         model, train_loader, val_loader, optimizer, device, n_epochs=settings["num_epochs"],
-        eval_freq=5, eval_iter=1, start_context="Every effort moves you",
+        eval_freq=eval_freq, eval_iter=eval_iter, start_context="Every effort moves you",
         tokenizer=tokenizer, warmup_steps=warmup_steps, 
         initial_lr=1e-5, min_lr=1e-5
-    )"""
-
-    train_losses, val_losses, tokens_seen = train_model_simple(
-        model, train_loader, val_loader, optimizer, device, settings["num_epochs"],
-        eval_freq, eval_iter, "Every effort moves you", tokenizer
     )
     
     endDateTime = time.time()
@@ -305,7 +302,7 @@ if __name__ == "__main__":
 
     OTHER_SETTINGS = {
         "learning_rate": 5e-4,
-        "num_epochs": 10,
+        "num_epochs": 15,
         "batch_size": 2,
         "weight_decay": 0.1
     }
