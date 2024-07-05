@@ -6,20 +6,17 @@ import numpy as np  # Add this line to import numpy
 import matplotlib
 matplotlib.use('Agg')  # Add this line to use matplotlib without a display
 import matplotlib.pyplot as plt
+from torch.cuda.amp import autocast, GradScaler
+
 #from galore_torch import GaLoreAdamW
 import os
 import torch
-import urllib.request
 import tiktoken
-# Our classes:
-from architecture.multiheadattention import MultiHeadAttention
-from architecture.transformerblock import LayerNorm, GELU, FeedForward, TransformerBlock
-from architecture.gpt import GPTModel
-from architecture.dataset import GPTDataset, create_dataloader_v1
-import torch_optimizer as optim
-import SM3
 
-from torch.cuda.amp import autocast, GradScaler
+# Our classes:
+from architecture.gpt import GPTModel
+from architecture.dataset import create_dataloader_v1
+
 
 def text_to_token_ids(text, tokenizer):
     encoded = tokenizer.encode(text)
@@ -32,16 +29,11 @@ def token_ids_to_text(token_ids, tokenizer):
 
 def calc_loss_batch(input_batch, target_batch, model, device):
     input_batch, target_batch = input_batch.to(device), target_batch.to(device)
-
-    with autocast():
-        logits = model(input_batch)
-        logits = logits.flatten(0, 1).float()
-        target_batch = target_batch.flatten().long().to(device)
-        loss = torch.nn.functional.cross_entropy(logits, target_batch)
-
+    logits = model(input_batch)
+    loss = torch.nn.functional.cross_entropy(logits.flatten(0, 1), target_batch.flatten())
     return loss
 
-def calc_loss_loader(data_loader, model, device, scaler, optimizer, num_batches=None):
+def calc_loss_loader(data_loader, model, device, num_batches=None):
     total_loss = 0.
     if len(data_loader) == 0:
         return float("nan")
@@ -49,25 +41,19 @@ def calc_loss_loader(data_loader, model, device, scaler, optimizer, num_batches=
         num_batches = len(data_loader)
     else:
         num_batches = min(num_batches, len(data_loader))
-    
     for i, (input_batch, target_batch) in enumerate(data_loader):
         if i < num_batches:
             loss = calc_loss_batch(input_batch, target_batch, model, device)
             total_loss += loss.item()
-
-            if optimizer is not None:
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad()
-    
+        else:
+            break
     return total_loss / num_batches
 
-def evaluate_model(model, train_loader, val_loader, device, eval_iter, scaler):
+def evaluate_model(model, train_loader, val_loader, device, eval_iter):
     model.eval()
     with torch.no_grad():
-        train_loss = calc_loss_loader(train_loader, model, device, scaler, optimizer=None, num_batches=eval_iter)
-        val_loss = calc_loss_loader(val_loader, model, device, scaler, optimizer=None, num_batches=eval_iter)
+        train_loss = calc_loss_loader(train_loader, model, device, num_batches=eval_iter)
+        val_loss = calc_loss_loader(val_loader, model, device, num_batches=eval_iter)
     model.train()
     return train_loss, val_loss
 
@@ -82,7 +68,7 @@ def generate_and_print_sample(model, tokenizer, device, start_context):
         print(decoded_text.replace("\n", " "))  # Compact print format
     model.train()
 
-def plot_losses(epochs_seen, tokens_seen, train_losses, val_losses, learning_rates):
+def plot_losses(epochs_seen, tokens_seen, train_losses, val_losses):
     fig, ax1 = plt.subplots()
     # Plot training and validation loss against epochs (primary y-axis)
     ax1.plot(epochs_seen, train_losses, label="Training loss", marker='o')
@@ -90,95 +76,114 @@ def plot_losses(epochs_seen, tokens_seen, train_losses, val_losses, learning_rat
     ax1.set_xlabel("Epochs")
     ax1.set_ylabel("Loss")
     ax1.legend(loc="upper right")
+
     # Create a second x-axis for tokens seen
     ax2 = ax1.twiny()  # Share the y-axis
     ax2.plot(tokens_seen, train_losses, alpha=0)  # Invisible plot to align ticks
     ax2.set_xlabel("Tokens seen")
-    # Create a third y-axis for learning rates (secondary y-axis)
-    ax3 = ax1.twinx()  # Share the x-axis
-    ax3.plot(epochs_seen, learning_rates, color="green", label="Learning rate", linestyle=":", marker='^')
-    ax3.set_ylabel("Learning Rate")
-    ax3.legend(loc="upper left")
     fig.tight_layout()
 
-def train_model_simple(model, train_loader, val_loader, optimizer, device, n_epochs, eval_freq, eval_iter, start_context, tokenizer):
+def train_model_simple(model, train_loader, val_loader, optimizer, device, num_epochs, eval_freq, eval_iter, start_context, tokenizer):
+    # Initialize lists to track losses and tokens seen
     train_losses, val_losses, track_tokens_seen = [], [], []
-    tokens_seen = 0
-    global_step = -1
-    scaler = GradScaler()
-    
-    for epoch in range(n_epochs):
+    tokens_seen, global_step = 0, -1
+
+    # Main training loop
+    for epoch in range(num_epochs):
         model.train()  # Set model to training mode
+        
         for input_batch, target_batch in train_loader:
-            optimizer.zero_grad()  # Reset loss gradients from previous batch iteration
+            optimizer.zero_grad() # Reset loss gradients from previous batch iteration
             loss = calc_loss_batch(input_batch, target_batch, model, device)
-            scaler.step(optimizer)
-            scaler.update()
+            loss.backward() # Calculate loss gradients
+            optimizer.step() # Update model weights using loss gradients
             tokens_seen += input_batch.numel()
             global_step += 1
-            
+
+            # Optional evaluation step
             if global_step % eval_freq == 0:
                 train_loss, val_loss = evaluate_model(
                     model, train_loader, val_loader, device, eval_iter)
                 train_losses.append(train_loss)
                 val_losses.append(val_loss)
                 track_tokens_seen.append(tokens_seen)
-                print(f"Epoch {epoch+1} (Step {global_step:06d}): "
+                print(f"Ep {epoch+1} (Step {global_step:06d}): "
                       f"Train loss {train_loss:.3f}, Val loss {val_loss:.3f}")
-        
+
+        # Print a sample text after each epoch
         generate_and_print_sample(
             model, tokenizer, device, start_context
         )
+
     return train_losses, val_losses, track_tokens_seen
 
-def train_model(model, train_loader, val_loader, optimizer, device, n_epochs, eval_freq, eval_iter, start_context, tokenizer, warmup_steps, initial_lr=3e-05, min_lr=1e-6, save_every=5):
+def train_model(model, train_loader, val_loader, optimizer, device,
+                n_epochs, eval_freq, eval_iter, start_context, tokenizer,
+                warmup_steps, initial_lr=3e-05, min_lr=1e-6):
+
     train_losses, val_losses, track_tokens_seen, track_lrs = [], [], [], []
     tokens_seen, global_step = 0, -1
+
+    # Retrieve the maximum learning rate from the optimizer
     peak_lr = optimizer.param_groups[0]["lr"]
+
+    # Calculate the total number of iterations in the training process
     total_training_steps = len(train_loader) * n_epochs
+
+    # Calculate the learning rate increment during the warmup phase
     lr_increment = (peak_lr - initial_lr) / warmup_steps
-    scaler = GradScaler()
-    
+
     for epoch in range(n_epochs):
         model.train()
         for input_batch, target_batch in train_loader:
             optimizer.zero_grad()
             global_step += 1
 
+            # Adjust the learning rate based on the current phase (warmup or cosine annealing)
             if global_step < warmup_steps:
-                lr = initial_lr + global_step * lr_increment
+                # Linear warmup
+                lr = initial_lr + global_step * lr_increment  
             else:
-                progress = ((global_step - warmup_steps) / (total_training_steps - warmup_steps))
+                # Cosine annealing after warmup
+                progress = ((global_step - warmup_steps) / 
+                            (total_training_steps - warmup_steps))
                 lr = min_lr + (peak_lr - min_lr) * 0.5 * (1 + math.cos(math.pi * progress))
 
+            # Apply the calculated learning rate to the optimizer
             for param_group in optimizer.param_groups:
                 param_group["lr"] = lr
+            track_lrs.append(lr)  # Store the current learning rate
 
+            # Calculate and backpropagate the loss
+            loss = calc_loss_batch(input_batch, target_batch, model, device)
+            loss.backward()
+
+            # Apply gradient clipping after the warmup phase to avoid exploding gradients
             if global_step > warmup_steps:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
-            with autocast():
-                loss = calc_loss_batch(input_batch, target_batch, model, device)
             
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+            optimizer.step()
             tokens_seen += input_batch.numel()
 
+            # Periodically evaluate the model on the training and validation sets
             if global_step % eval_freq == 0:
-                train_loss, val_loss = evaluate_model(model, train_loader, val_loader, device, eval_iter, scaler)
+                train_loss, val_loss = evaluate_model(
+                    model, train_loader, val_loader,
+                    device, eval_iter
+                )
                 train_losses.append(train_loss)
                 val_losses.append(val_loss)
                 track_tokens_seen.append(tokens_seen)
-                track_lrs.append(lr)
+                # Print the current losses
+                print(f"Ep {epoch+1} (Iter {global_step:06d}): "
+                      f"Train loss {train_loss:.3f}, "
+                      f"Val loss {val_loss:.3f}"
+                )
 
-                print(f"Ep {epoch+1} (Iter {global_step:06d}): Train loss {train_loss:.3f}, Val loss {val_loss:.3f}")
-
-        generate_and_print_sample(model, tokenizer, device, start_context)
-
-        if (epoch + 1) % save_every == 0:
-            output_name = f"./output/model_and_optimizer_{epoch+1}.pth"
-            torch.save({"model_state_dict": model.state_dict(), "optimizer_state_dict": optimizer.state_dict()}, output_name)
+        # Generate and print a sample from the model to monitor progress
+        generate_and_print_sample(
+            model, tokenizer, device, start_context
+        )
 
     return train_losses, val_losses, track_tokens_seen, track_lrs
 
@@ -205,18 +210,18 @@ def main(gpt_config, settings, continue_training_from="", compile_model=True):
         print("Initializing model...")
         model = GPTModel(gpt_config)
     
-    #model.half()
-    model.to(device)
-    model.pos_emb.to(device)
-    
-    if compile_model:
-        print("Compiling model...")
-        model = torch.compile(model)
-        if os.name == "nt":
-            print("Windows OS detected. Setting trinitron fallback to True.")
-            torch._dynamo.config.suppress_errors = True
-    
-    optimizer = torch.optim.AdamW(model.parameters(), lr=settings["learning_rate"], weight_decay=settings["weight_decay"])
+        #model.half()
+        model.to(device)
+        model.pos_emb.to(device)
+        
+        if compile_model:
+            print("Compiling model...")
+            model = torch.compile(model)
+            if os.name == "nt":
+                print("Windows OS detected. Setting trinitron fallback to True.")
+                torch._dynamo.config.suppress_errors = True
+        
+        optimizer = torch.optim.AdamW(model.parameters(), lr=settings["learning_rate"], weight_decay=settings["weight_decay"])
     
     print("Setting up dataloaders...")
     train_ratio = 0.90
@@ -242,34 +247,41 @@ def main(gpt_config, settings, continue_training_from="", compile_model=True):
     
     print("Loading tokenizer...")
     tokenizer = tiktoken.get_encoding("gpt2")
+
     print("Training model...")
     startDateTime = time.time()
     total_steps = len(train_loader) * settings["num_epochs"]
     warmup_steps = int(0.2 * total_steps)
-    eval_freq = 100
+    eval_freq = 10
     eval_iter = 1
     save_every = 99999
-    train_losses, val_losses, tokens_seen, learning_rates = train_model(
-        model, train_loader, val_loader, optimizer, device,
-        n_epochs=settings["num_epochs"], eval_freq=eval_freq, eval_iter=eval_iter,
-        start_context="Every effort moves you", tokenizer=tokenizer, warmup_steps=warmup_steps, save_every=save_every
+    
+    """train_losses, val_losses, tokens_seen, lrs = train_model(
+        model, train_loader, val_loader, optimizer, device, n_epochs=settings["num_epochs"],
+        eval_freq=5, eval_iter=1, start_context="Every effort moves you",
+        tokenizer=tokenizer, warmup_steps=warmup_steps, 
+        initial_lr=1e-5, min_lr=1e-5
+    )"""
+
+    train_losses, val_losses, tokens_seen = train_model_simple(
+        model, train_loader, val_loader, optimizer, device, settings["num_epochs"],
+        eval_freq, eval_iter, "Every effort moves you", tokenizer
     )
     
     endDateTime = time.time()
     timeTaken = endDateTime - startDateTime
     print(f"Time taken: {timeTaken}")
-    return train_losses, val_losses, tokens_seen, model, learning_rates
+    return train_losses, val_losses, tokens_seen, model
 
 if __name__ == "__main__":
     GPT_CONFIG_124M = {
-        "vocab_size": 50257,
-        "context_length": 2048,
-        "emb_dim": 768,
-        "n_heads": 16,
-        "n_layers": 24,
-        "drop_rate": 0.1,
-        "qkv_bias": False,
-        "window_size": 768  # for example, a window size of 256 tokens
+        "vocab_size": 50257,    # Vocabulary size
+        "context_length": 256,  # Shortened context length (orig: 1024)
+        "emb_dim": 768,         # Embedding dimension
+        "n_heads": 12,          # Number of attention heads
+        "n_layers": 12,         # Number of layers
+        "drop_rate": 0.1,       # Dropout rate
+        "qkv_bias": False       # Query-key-value bias
     }
     GPT_CONFIG_350M = {
         "vocab_size": 50257,
@@ -293,13 +305,13 @@ if __name__ == "__main__":
 
     OTHER_SETTINGS = {
         "learning_rate": 5e-4,
-        "num_epochs": 6,
-        "batch_size": 1,
+        "num_epochs": 10,
+        "batch_size": 2,
         "weight_decay": 0.1
     }
 
-    train_losses, val_losses, tokens_seen, model, learning_rates = main(GPT_CONFIG_124M, OTHER_SETTINGS, "", False)
+    train_losses, val_losses, tokens_seen, model = main(GPT_CONFIG_124M, OTHER_SETTINGS, "", False)
     epochs_tensor = torch.linspace(0, OTHER_SETTINGS["num_epochs"], len(train_losses))
-    plot_losses(epochs_tensor, tokens_seen, train_losses, val_losses, learning_rates)
+    plot_losses(epochs_tensor, tokens_seen, train_losses, val_losses)
     plt.savefig("./output/loss.jpg")
     torch.save(model.state_dict(), "./output/model.pth")
