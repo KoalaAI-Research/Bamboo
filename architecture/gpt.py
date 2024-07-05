@@ -14,12 +14,15 @@ class GPTModel(nn.Module):
         self.drop_emb = nn.Dropout(cfg["drop_rate"])
         self.context_length = cfg["context_length"]
 
+        # Ensure window size is set if using sliding window attention
+        self.window_size = cfg.get("window_size", None)
+
         self.trf_blocks = nn.Sequential(
             *[tb.TransformerBlock(cfg) for _ in range(cfg["n_layers"])])
 
         self.final_norm = tb.LayerNorm(cfg["emb_dim"])
         self.out_head = nn.Linear(cfg["emb_dim"], cfg["vocab_size"], bias=False)
-
+        
     def forward(self, in_idx):
         batch_size, seq_len = in_idx.shape
         tok_embeds = self.tok_emb(in_idx)
