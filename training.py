@@ -1,5 +1,6 @@
 # Import necessary libraries
 import datetime
+import json
 import math
 import time
 import numpy as np  # Add this line to import numpy
@@ -15,7 +16,7 @@ import tiktoken
 
 # Our classes:
 from architecture.gpt import GPTModel
-from architecture.dataset import create_dataloader_v1
+from architecture.dataset import CreateDataloader
 
 
 def text_to_token_ids(text, tokenizer):
@@ -196,7 +197,7 @@ def main(gpt_config, settings, continue_training_from="", compile_model=True):
         print("Using the CPU! ❄️")
 
     print("Loading tokenizer...")
-    tokenizer = tiktoken.get_encoding("o200k_base")
+    tokenizer = tiktoken.get_encoding(gpt_config["tokenizer"])
     gpt_config["vocab_size"] = tokenizer.n_vocab # Update the vocab size in the GPT configuration, based on the tokenizer
 
     file_path = "./training_data/the-verdict.txt"
@@ -207,7 +208,7 @@ def main(gpt_config, settings, continue_training_from="", compile_model=True):
         print("Continuing training from a previous checkpoint...")
         checkpoint = torch.load(continue_training_from)
 
-        model = GPTModel(GPT_CONFIG_124M)
+        model = GPTModel(gpt_config)
         model.load_state_dict(checkpoint["model_state_dict"])
 
         optimizer = torch.optim.AdamW(model.parameters(), weight_decay=settings["weight_decay"])
@@ -238,7 +239,7 @@ def main(gpt_config, settings, continue_training_from="", compile_model=True):
     print("Setting up dataloaders...")
     train_ratio = 0.90
     split_idx = int(train_ratio * len(text_data))
-    train_loader = create_dataloader_v1(
+    train_loader = CreateDataloader(
         text_data[:split_idx],
         batch_size=settings["batch_size"],
         max_length=gpt_config["context_length"],
@@ -247,7 +248,7 @@ def main(gpt_config, settings, continue_training_from="", compile_model=True):
         shuffle=True,
         num_workers=0
     )
-    val_loader = create_dataloader_v1(
+    val_loader = CreateDataloader(
         text_data[split_idx:],
         batch_size=settings["batch_size"],
         max_length=gpt_config["context_length"],
@@ -279,13 +280,14 @@ def main(gpt_config, settings, continue_training_from="", compile_model=True):
 
 if __name__ == "__main__":
     GPT_CONFIG_124M = {
-        "context_length": 512,  # Shortened context length (orig: 1024)
+        "tokenizer": "o200k_base", # Tokenizer to use, default GPT-4o tokenizer
+        "context_length": 1536,  # Shortened context length (orig: 1024)
         "emb_dim": 768,         # Embedding dimension
         "n_heads": 12,          # Number of attention heads
         "n_layers": 8,         # Number of layers
         "drop_rate": 0.1,       # Dropout rate
         "qkv_bias": False,       # Query-key-value bias,
-        "window_size": 256      # Window size for sliding window attention
+        "window_size": 1024      # Window size for sliding window attention
     }
     GPT_CONFIG_350M = {
         "context_length": 1024,
@@ -307,7 +309,7 @@ if __name__ == "__main__":
 
     OTHER_SETTINGS = {
         "learning_rate": 5e-4,
-        "num_epochs": 15,
+        "num_epochs": 3,
         "batch_size": 2,
         "weight_decay": 0.1
     }
@@ -316,4 +318,10 @@ if __name__ == "__main__":
     epochs_tensor = torch.linspace(0, OTHER_SETTINGS["num_epochs"], len(train_losses))
     plot_losses(epochs_tensor, tokens_seen, train_losses, val_losses)
     plt.savefig("./output/loss.jpg")
+
+    # Save the model:
     torch.save(model.state_dict(), "./output/model.pth")
+
+    # Save the config as a json file:
+    with open("./output/config.json", "w") as f:
+        json.dump(GPT_CONFIG_124M, f)

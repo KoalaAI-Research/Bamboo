@@ -1,23 +1,20 @@
+import json
 from architecture.gpt import GPTModel
 import tiktoken
 import torch
 
-# Load tokenizer
-tokenizer = tiktoken.get_encoding("o200k_base")
+# Load the model config from json:
+config_file = "./output/config.json"
 
-# Define the GPT configuration
-GPT_CONFIG_124M = {
-    "vocab_size": tokenizer.n_vocab,    # Vocabulary size
-    "context_length": 1024,  # Shortened context length (orig: 1024)
-    "emb_dim": 768,         # Embedding dimension
-    "n_heads": 12,          # Number of attention heads
-    "n_layers": 12,         # Number of layers
-    "drop_rate": 0.1,       # Dropout rate
-    "qkv_bias": False       # Query-key-value bias
-}
+# Load the model config
+with open(config_file, "r") as f:
+    config = json.load(f)
+
+# Load the tokenizer
+tokenizer = tiktoken.get_tokenizer(config["tokenizer"])
 
 # Load the GPT model
-gpt_model = GPTModel(GPT_CONFIG_124M)
+gpt_model = GPTModel(config)
 gpt_model.load_state_dict(torch.load("./output/model.pth"))
 
 def text_to_token_ids(text, tokenizer):

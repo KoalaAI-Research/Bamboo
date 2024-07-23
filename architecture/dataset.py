@@ -2,7 +2,7 @@ import tiktoken
 import torch
 from torch.utils.data import Dataset, DataLoader
 
-class GPTDataset(Dataset):
+class BambooDataset(Dataset):
     def __init__(self, txt, tokenizer, max_length, stride):
         self.input_ids = []
         self.target_ids = []
@@ -30,12 +30,12 @@ class GPTDataset(Dataset):
         return torch.load(path)
 
 
-def create_dataloader_v1(txt, batch_size=4, max_length=256, stride=128, shuffle=True, drop_last=True, num_workers=0):
+def CreateDataloader(tokenizer, txt, batch_size=4, max_length=256, stride=128, shuffle=True, drop_last=True, num_workers=0):
     # Initialize the tokenizer
-    tokenizer = tiktoken.get_encoding("o200k_base")
+    tokenizer = tiktoken.get_encoding(tokenizer)
 
     # Create dataset
-    dataset = GPTDataset(txt, tokenizer, max_length, stride)
+    dataset = BambooDataset(txt, tokenizer, max_length, stride)
 
     # Create dataloader
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, drop_last=drop_last, num_workers=num_workers)

@@ -23,6 +23,8 @@ class GPTModel(nn.Module):
         self.final_norm = tb.LayerNorm(cfg["emb_dim"])
         self.out_head = nn.Linear(cfg["emb_dim"], cfg["vocab_size"], bias=False)
         
+        self.printInfo()
+
     def forward(self, in_idx):
         batch_size, seq_len = in_idx.shape
         tok_embeds = self.tok_emb(in_idx)
