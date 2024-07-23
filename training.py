@@ -229,10 +229,14 @@ def main(gpt_config, settings, continue_training_from="", compile_model=True):
         
         if compile_model:
             print("Compiling model...")
-            model = torch.compile(model)
+
+            # If on Windows, use regular torch compilation:
             if os.name == "nt":
-                print("Windows OS detected. Setting trinitron fallback to True.")
+                print("Windows OS detected. Compiling as torch.compile() + Setting trinitron fallback to True.")
+                model = torch.compile(model)
                 torch._dynamo.config.suppress_errors = True
+            else:
+                model = thunder.jit(model)
         
         optimizer = torch.optim.AdamW(model.parameters(), weight_decay=settings["weight_decay"])
     
