@@ -3,11 +3,11 @@ import tiktoken
 import torch
 
 # Load tokenizer
-tokenizer = tiktoken.get_encoding("gpt2")
+tokenizer = tiktoken.get_encoding("o200k_base")
 
 # Define the GPT configuration
 GPT_CONFIG_124M = {
-    "vocab_size": 50257,    # Vocabulary size
+    "vocab_size": tokenizer.n_vocab,    # Vocabulary size
     "context_length": 1024,  # Shortened context length (orig: 1024)
     "emb_dim": 768,         # Embedding dimension
     "n_heads": 12,          # Number of attention heads

@@ -195,6 +195,10 @@ def main(gpt_config, settings, continue_training_from="", compile_model=True):
     else:
         print("Using the CPU! ❄️")
 
+    print("Loading tokenizer...")
+    tokenizer = tiktoken.get_encoding("o200k_base")
+    gpt_config["vocab_size"] = tokenizer.n_vocab # Update the vocab size in the GPT configuration, based on the tokenizer
+
     file_path = "./training_data/the-verdict.txt"
     with open(file_path, "r", encoding="utf-8") as file:
         text_data = file.read()
@@ -212,9 +216,15 @@ def main(gpt_config, settings, continue_training_from="", compile_model=True):
         print("Initializing model...")
         model = GPTModel(gpt_config)
     
-        #model.half()
-        model.to(device)
-        model.pos_emb.to(device)
+        if device.type == "cuda":
+            # Check if the GPU supports bfloat16
+            if torch.cuda.get_device_capability()[0] >= 8:
+                print("Converting model to bfloat16...")
+                model.to(device=device, dtype=torch.bfloat16)
+                model.pos_emb.to(device, dtype=torch.bfloat16)
+            else:
+                model.to(device)
+                model.pos_emb.to(device)
         
         if compile_model:
             print("Compiling model...")
@@ -246,9 +256,6 @@ def main(gpt_config, settings, continue_training_from="", compile_model=True):
         shuffle=False,
         num_workers=0
     )
-    
-    print("Loading tokenizer...")
-    tokenizer = tiktoken.get_encoding("gpt2")
 
     print("Training model...")
     startDateTime = time.time()
@@ -272,17 +279,15 @@ def main(gpt_config, settings, continue_training_from="", compile_model=True):
 
 if __name__ == "__main__":
     GPT_CONFIG_124M = {
-        "vocab_size": 50257,    # Vocabulary size
-        "context_length": 1024,  # Shortened context length (orig: 1024)
+        "context_length": 512,  # Shortened context length (orig: 1024)
         "emb_dim": 768,         # Embedding dimension
         "n_heads": 12,          # Number of attention heads
-        "n_layers": 12,         # Number of layers
+        "n_layers": 8,         # Number of layers
         "drop_rate": 0.1,       # Dropout rate
         "qkv_bias": False,       # Query-key-value bias,
         "window_size": 256      # Window size for sliding window attention
     }
     GPT_CONFIG_350M = {
-        "vocab_size": 50257,
         "context_length": 1024,
         "emb_dim": 1024,
         "n_heads": 16,
@@ -292,7 +297,6 @@ if __name__ == "__main__":
         "window_size": 256
     }
     GPT_CONFIG_760M = {
-        "vocab_size": 50257,
         "context_length": 1024,
         "emb_dim": 1280,
         "n_heads": 20,
