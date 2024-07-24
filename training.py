@@ -200,7 +200,7 @@ def main(gpt_config, settings, continue_training_from="", compile_model=True):
     tokenizer = tiktoken.get_encoding(gpt_config["tokenizer"])
     gpt_config["vocab_size"] = tokenizer.n_vocab # Update the vocab size in the GPT configuration, based on the tokenizer
 
-    file_path = "./training_data/the-verdict.txt"
+    file_path = "./training_data/grug.txt"
     with open(file_path, "r", encoding="utf-8") as file:
         text_data = file.read()
     
@@ -244,6 +244,7 @@ def main(gpt_config, settings, continue_training_from="", compile_model=True):
     train_ratio = 0.90
     split_idx = int(train_ratio * len(text_data))
     train_loader = CreateDataloader(
+        gpt_config["tokenizer"],
         text_data[:split_idx],
         batch_size=settings["batch_size"],
         max_length=gpt_config["context_length"],
@@ -253,6 +254,7 @@ def main(gpt_config, settings, continue_training_from="", compile_model=True):
         num_workers=0
     )
     val_loader = CreateDataloader(
+        gpt_config["tokenizer"],
         text_data[split_idx:],
         batch_size=settings["batch_size"],
         max_length=gpt_config["context_length"],
@@ -269,6 +271,9 @@ def main(gpt_config, settings, continue_training_from="", compile_model=True):
     eval_freq = 5
     eval_iter = 1
     save_every = 99999
+
+    if warmup_steps == 0:
+        warmup_steps = 1
     
     train_losses, val_losses, tokens_seen, lrs = train_model(
         model, train_loader, val_loader, optimizer, device, n_epochs=settings["num_epochs"],
@@ -283,16 +288,7 @@ def main(gpt_config, settings, continue_training_from="", compile_model=True):
     return train_losses, val_losses, tokens_seen, model
 
 if __name__ == "__main__":
-    GPT_CONFIG_124M = {
-        "tokenizer": "o200k_base", # Tokenizer to use, default GPT-4o tokenizer
-        "context_length": 1536,  # Shortened context length (orig: 1024)
-        "emb_dim": 768,         # Embedding dimension
-        "n_heads": 12,          # Number of attention heads
-        "n_layers": 8,         # Number of layers
-        "drop_rate": 0.1,       # Dropout rate
-        "qkv_bias": False,       # Query-key-value bias,
-        "window_size": 1024      # Window size for sliding window attention
-    }
+    
     GPT_CONFIG_350M = {
         "context_length": 1024,
         "emb_dim": 1024,
@@ -311,6 +307,19 @@ if __name__ == "__main__":
         "qkv_bias": False
     }
 
+    
+
+    BAMBOO_CONFIG_365M = {
+        "tokenizer": "o200k_base", # Tokenizer to use, default GPT-4o tokenizer
+        "context_length": 1536,  # Shortened context length (orig: 1024)
+        "emb_dim": 768,         # Embedding dimension
+        "n_heads": 12,          # Number of attention heads
+        "n_layers": 8,         # Number of layers
+        "drop_rate": 0.1,       # Dropout rate
+        "qkv_bias": False,       # Query-key-value bias,
+        "window_size": 1024      # Window size for sliding window attention
+    }
+
     OTHER_SETTINGS = {
         "learning_rate": 5e-4,
         "num_epochs": 3,
@@ -318,14 +327,21 @@ if __name__ == "__main__":
         "weight_decay": 0.1
     }
 
-    train_losses, val_losses, tokens_seen, model = main(GPT_CONFIG_124M, OTHER_SETTINGS, "", False)
+    train_losses, val_losses, tokens_seen, model = main(BAMBOO_CONFIG_365M, OTHER_SETTINGS, "", False)
     epochs_tensor = torch.linspace(0, OTHER_SETTINGS["num_epochs"], len(train_losses))
     plot_losses(epochs_tensor, tokens_seen, train_losses, val_losses)
     plt.savefig("./output/loss.jpg")
 
+    model_name = "bamboo-1-365M"
+    file_path_folder = f"./output/{model_name}"
+
+    # Create folder if it does not exist:
+    if not os.path.exists(file_path_folder):
+        os.makedirs(file_path_folder)
+
     # Save the model:
-    torch.save(model.state_dict(), "./output/model.pth")
+    torch.save(model.state_dict(), f"{file_path_folder}/model.pth")
 
     # Save the config as a json file:
-    with open("./output/config.json", "w") as f:
-        json.dump(GPT_CONFIG_124M, f)
+    with open(f"{file_path_folder}/config.json", "w") as f:
+        json.dump(BAMBOO_CONFIG_365M, f)

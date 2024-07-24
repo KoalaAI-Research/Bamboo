@@ -15,10 +15,10 @@ class GPTModel(nn.Module):
         self.context_length = cfg["context_length"]
 
         # Ensure window size is set if using sliding window attention
-        self.window_size = cfg.get("window_size", None)
+        self.window_size = cfg["window_size"]
 
         self.trf_blocks = nn.Sequential(
-            *[tb.TransformerBlock(cfg) for _ in range(cfg["n_layers"])])
+            *[tb.TransformerBlockWithSlidingWindow(cfg) for _ in range(cfg["n_layers"])])
 
         self.final_norm = tb.LayerNorm(cfg["emb_dim"])
         self.out_head = nn.Linear(cfg["emb_dim"], cfg["vocab_size"], bias=False)

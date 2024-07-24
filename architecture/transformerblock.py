@@ -12,9 +12,8 @@ class LayerNorm(nn.Module):
     def forward(self, x):
         mean = x.mean(dim=-1, keepdim=True)
         var = x.var(dim=-1, keepdim=True, unbiased=False)
-        x.sub_(mean)
-        x.div_(torch.sqrt(var + self.eps))
-        return self.scale * x + self.shift
+        norm_x = (x - mean) / torch.sqrt(var + self.eps)
+        return self.scale * norm_x + self.shift
 
 class GELU(nn.Module):
     def __init__(self):
@@ -22,7 +21,7 @@ class GELU(nn.Module):
 
     def forward(self, x):
         return torch.nn.functional.gelu(x)
-
+    
 class FeedForward(nn.Module):
     def __init__(self, cfg):
         super().__init__()
