@@ -235,6 +235,10 @@ def load_or_initialize_model(gpt_config, settings, continue_training_from, devic
         print("Converting model to bfloat16...")
         model.to(device=device, dtype=torch.bfloat16)
         model.pos_emb.to(device, dtype=torch.bfloat16)
+    elif device.type == "cuda" and torch.cuda.get_device_capability()[0] > 4:
+        print("Converting model to float16...")
+        model.to(device=device, dtype=torch.float16)
+        model.pos_emb.to(device, dtype=torch.float16)
     else:
         model.to(device)
         model.pos_emb.to(device)
