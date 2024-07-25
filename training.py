@@ -8,6 +8,7 @@ import matplotlib
 matplotlib.use('Agg')  # Add this line to use matplotlib without a display
 import matplotlib.pyplot as plt
 from torch.cuda.amp import autocast, GradScaler
+from datasets import load_dataset
 
 #from galore_torch import GaLoreAdamW
 import os
@@ -17,7 +18,6 @@ import tiktoken
 # Our classes:
 from architecture.gpt import GPTModel
 from architecture.dataset import CreateDataloader
-
 
 def text_to_token_ids(text, tokenizer):
     encoded = tokenizer.encode(text)
@@ -120,7 +120,7 @@ def train_model_simple(model, train_loader, val_loader, optimizer, device, num_e
 
 def train_model(model, train_loader, val_loader, optimizer, device,
                 n_epochs, eval_freq, eval_iter, start_context, tokenizer,
-                warmup_steps, initial_lr=3e-05, min_lr=1e-6):
+                warmup_steps, initial_lr=3e-05, min_lr=1e-6, save_every=500):
 
     train_losses, val_losses, track_tokens_seen, track_lrs = [], [], [], []
     tokens_seen, global_step = 0, -1
@@ -135,7 +135,9 @@ def train_model(model, train_loader, val_loader, optimizer, device,
     lr_increment = (peak_lr - initial_lr) / warmup_steps
 
     for epoch in range(n_epochs):
+        start_time = time.time()  # Track start time for each epoch
         model.train()
+
         for input_batch, target_batch in train_loader:
             optimizer.zero_grad()
             global_step += 1
@@ -146,8 +148,7 @@ def train_model(model, train_loader, val_loader, optimizer, device,
                 lr = initial_lr + global_step * lr_increment  
             else:
                 # Cosine annealing after warmup
-                progress = ((global_step - warmup_steps) / 
-                            (total_training_steps - warmup_steps))
+                progress = ((global_step - warmup_steps) / (total_training_steps - warmup_steps))
                 lr = min_lr + (peak_lr - min_lr) * 0.5 * (1 + math.cos(math.pi * progress))
 
             # Apply the calculated learning rate to the optimizer
@@ -166,80 +167,118 @@ def train_model(model, train_loader, val_loader, optimizer, device,
             optimizer.step()
             tokens_seen += input_batch.numel()
 
+            # Calculate and display iterations per second
+            batch_time = time.time() - start_time         
+
             # Periodically evaluate the model on the training and validation sets
             if global_step % eval_freq == 0:
                 train_loss, val_loss = evaluate_model(
                     model, train_loader, val_loader,
                     device, eval_iter
                 )
+
                 train_losses.append(train_loss)
                 val_losses.append(val_loss)
                 track_tokens_seen.append(tokens_seen)
-                # Print the current losses
+
+                # Print the current losses + steps / sec
+                steps_per_second = 1.0 / batch_time
                 print(f"Ep {epoch+1} (Iter {global_step:06d}): "
                       f"Train loss {train_loss:.3f}, "
-                      f"Val loss {val_loss:.3f}"
+                      f"Val loss {val_loss:.3f}, "
+                      f"Steps/s: {steps_per_second:.2f}"
                 )
 
+            # Periodically save the model checkpoint:
+            if global_step > 0 and global_step % save_every == 0:
+                out_folder = "./output/"
+                torch.save(model.state_dict(), f"{out_folder}/model.pth")
+                torch.save(optimizer.state_dict(), f"{out_folder}/optimizer.pth")
+
+                # Save the config as a json file:
+                with open(f"{out_folder}/config.json", "w") as f:
+                    json.dump(model.config, f)
+
+                print(f"Saved model & optimizer state dict @ step: {global_step}")
+
         # Generate and print a sample from the model to monitor progress
-        generate_and_print_sample(
-            model, tokenizer, device, start_context
-        )
+        generate_and_print_sample(model, tokenizer, device, start_context)
 
     return train_losses, val_losses, track_tokens_seen, track_lrs
+
+def setup_tokenizer(gpt_config, checkpoint_path):
+    print("Loading tokenizer...")
+    if checkpoint_path:
+        config_file = f"{checkpoint_path}/config.json"
+        with open(config_file, "r") as f:
+            checkpoint_config = json.load(f)
+        tokenizer = tiktoken.get_encoding(checkpoint_config["tokenizer"])
+        gpt_config = checkpoint_config  # Use the checkpoint's config
+    else:
+        tokenizer = tiktoken.get_encoding(gpt_config["tokenizer"])
+    
+    gpt_config["vocab_size"] = tokenizer.n_vocab
+    return tokenizer, gpt_config
+
+def load_or_initialize_model(gpt_config, settings, continue_training_from, device, compile_model):
+    if continue_training_from:
+        print("Continuing training from a previous checkpoint...")
+        model = GPTModel(gpt_config)
+        checkpoint = torch.load(f"{continue_training_from}/model.pth", map_location=device)
+        model.load_state_dict(checkpoint)
+    else:
+        print("Initializing new model...")
+        model = GPTModel(gpt_config)
+
+    # Common model setup
+    if device.type == "cuda" and torch.cuda.get_device_capability()[0] >= 8:
+        print("Converting model to bfloat16...")
+        model.to(device=device, dtype=torch.bfloat16)
+        model.pos_emb.to(device, dtype=torch.bfloat16)
+    else:
+        model.to(device)
+        model.pos_emb.to(device)
+
+    if compile_model and not continue_training_from:
+        model = compile_model_based_on_os(model)
+
+    optimizer = torch.optim.AdamW(model.parameters(), weight_decay=settings["weight_decay"])
+    
+    if continue_training_from:
+        optimizer.load_state_dict(torch.load(f"{continue_training_from}/optimizer.pth", map_location=device))
+
+    return model, optimizer
+
+def compile_model_based_on_os(model):
+    print("Compiling model...")
+    if os.name == "nt":
+        print("Windows OS detected. Compiling as torch.compile() + Setting trinitron fallback to True.")
+        model = torch.compile(model)
+        torch._dynamo.config.suppress_errors = True
+    else:
+        model = thunder.jit(model)
+    return model
 
 def main(gpt_config, settings, continue_training_from="", compile_model=True):
     torch.manual_seed(123)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if device.type == "cuda":
-        print("Using the GPU! 🔥")
-    else:
-        print("Using the CPU! ❄️")
+    print(f"Using the {'GPU! 🔥' if device.type == 'cuda' else 'CPU! ❄️'}")
 
-    print("Loading tokenizer...")
-    tokenizer = tiktoken.get_encoding(gpt_config["tokenizer"])
-    gpt_config["vocab_size"] = tokenizer.n_vocab # Update the vocab size in the GPT configuration, based on the tokenizer
-
-    file_path = "./training_data/grug.txt"
+    # Old-style data loading from a local file, uncomment if you want to use it:
+    """file_path = "./training_data/grug.txt"
     with open(file_path, "r", encoding="utf-8") as file:
-        text_data = file.read()
+        text_data = file.read()"""
     
-    if continue_training_from != "":
-        print("Continuing training from a previous checkpoint...")
-        checkpoint = torch.load(continue_training_from)
+    # Load the data to train on from huggingface:
+    dataset = load_dataset("stas/openwebtext-10k")
 
-        model = GPTModel(gpt_config)
-        model.load_state_dict(checkpoint["model_state_dict"])
+    # Access the text data (might differ depending on the dataset format)
+    text_data = dataset["train"]["text"]  # Assuming the text data is in the "text" column of the training split
+    text_data = "\n".join(text_data) # Flatten text to a single string for us to split up later.
 
-        optimizer = torch.optim.AdamW(model.parameters(), weight_decay=settings["weight_decay"])
-        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-    else:
-        print("Initializing model...")
-        model = GPTModel(gpt_config)
-    
-        if device.type == "cuda":
-            # Check if the GPU supports bfloat16
-            if torch.cuda.get_device_capability()[0] >= 8:
-                print("Converting model to bfloat16...")
-                model.to(device=device, dtype=torch.bfloat16)
-                model.pos_emb.to(device, dtype=torch.bfloat16)
-            else:
-                model.to(device)
-                model.pos_emb.to(device)
-        
-        if compile_model:
-            print("Compiling model...")
+    tokenizer, gpt_config = setup_tokenizer(gpt_config, continue_training_from)
+    model, optimizer = load_or_initialize_model(gpt_config, settings, continue_training_from, device, compile_model)
 
-            # If on Windows, use regular torch compilation:
-            if os.name == "nt":
-                print("Windows OS detected. Compiling as torch.compile() + Setting trinitron fallback to True.")
-                model = torch.compile(model)
-                torch._dynamo.config.suppress_errors = True
-            else:
-                model = thunder.jit(model)
-        
-        optimizer = torch.optim.AdamW(model.parameters(), weight_decay=settings["weight_decay"])
-    
     print("Setting up dataloaders...")
     train_ratio = 0.90
     split_idx = int(train_ratio * len(text_data))
@@ -270,7 +309,7 @@ def main(gpt_config, settings, continue_training_from="", compile_model=True):
     warmup_steps = int(0.2 * total_steps)
     eval_freq = 5
     eval_iter = 1
-    save_every = 99999
+    save_every = 500
 
     if warmup_steps == 0:
         warmup_steps = 1
@@ -279,7 +318,7 @@ def main(gpt_config, settings, continue_training_from="", compile_model=True):
         model, train_loader, val_loader, optimizer, device, n_epochs=settings["num_epochs"],
         eval_freq=eval_freq, eval_iter=eval_iter, start_context="Every effort moves you",
         tokenizer=tokenizer, warmup_steps=warmup_steps, 
-        initial_lr=1e-5, min_lr=1e-5
+        initial_lr=5e-5, min_lr=1e-5, save_every=save_every
     )
     
     endDateTime = time.time()
@@ -288,26 +327,6 @@ def main(gpt_config, settings, continue_training_from="", compile_model=True):
     return train_losses, val_losses, tokens_seen, model
 
 if __name__ == "__main__":
-    
-    GPT_CONFIG_350M = {
-        "context_length": 1024,
-        "emb_dim": 1024,
-        "n_heads": 16,
-        "n_layers": 24,
-        "drop_rate": 0.1,
-        "qkv_bias": False,
-        "window_size": 256
-    }
-    GPT_CONFIG_760M = {
-        "context_length": 1024,
-        "emb_dim": 1280,
-        "n_heads": 20,
-        "n_layers": 36,
-        "drop_rate": 0.1,
-        "qkv_bias": False
-    }
-
-    
 
     BAMBOO_CONFIG_365M = {
         "tokenizer": "o200k_base", # Tokenizer to use, default GPT-4o tokenizer
@@ -315,25 +334,25 @@ if __name__ == "__main__":
         "emb_dim": 768,         # Embedding dimension
         "n_heads": 12,          # Number of attention heads
         "n_layers": 8,         # Number of layers
-        "drop_rate": 0.1,       # Dropout rate
+        "drop_rate": 0.0,       # Dropout rate, disabled since it's no longer recommended for LLMs
         "qkv_bias": False,       # Query-key-value bias,
         "window_size": 1024      # Window size for sliding window attention
     }
 
     OTHER_SETTINGS = {
         "learning_rate": 5e-4,
-        "num_epochs": 3,
+        "num_epochs": 6,
         "batch_size": 2,
         "weight_decay": 0.1
     }
 
+    model_name = "bamboo-1-365M-grug"
+    file_path_folder = f"./output/{model_name}"
+
     train_losses, val_losses, tokens_seen, model = main(BAMBOO_CONFIG_365M, OTHER_SETTINGS, "", False)
     epochs_tensor = torch.linspace(0, OTHER_SETTINGS["num_epochs"], len(train_losses))
     plot_losses(epochs_tensor, tokens_seen, train_losses, val_losses)
-    plt.savefig("./output/loss.jpg")
-
-    model_name = "bamboo-1-365M"
-    file_path_folder = f"./output/{model_name}"
+    plt.savefig(f"{file_path_folder}/loss.jpg")
 
     # Create folder if it does not exist:
     if not os.path.exists(file_path_folder):
