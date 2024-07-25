@@ -102,7 +102,7 @@ def train_model(model, train_loader, val_loader, optimizer, device, dtype,
     lr_increment = (peak_lr - initial_lr) / warmup_steps
 
     # Use GradScaler only for float16
-    use_scaler = dtype == torch.float16
+    use_scaler = False #dtype == torch.float16
     scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)
 
     for epoch in range(n_epochs):
