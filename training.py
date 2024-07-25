@@ -2,6 +2,7 @@
 import datetime
 import json
 import math
+import sys
 import time
 import numpy as np  # Add this line to import numpy
 import matplotlib
@@ -121,89 +122,66 @@ def train_model_simple(model, train_loader, val_loader, optimizer, device, num_e
 def train_model(model, train_loader, val_loader, optimizer, device,
                 n_epochs, eval_freq, eval_iter, start_context, tokenizer,
                 warmup_steps, initial_lr=3e-05, min_lr=1e-6, save_every=500):
-
     train_losses, val_losses, track_tokens_seen, track_lrs = [], [], [], []
     tokens_seen, global_step = 0, -1
-
-    # Retrieve the maximum learning rate from the optimizer
     peak_lr = optimizer.param_groups[0]["lr"]
-
-    # Calculate the total number of iterations in the training process
     total_training_steps = len(train_loader) * n_epochs
-
-    # Calculate the learning rate increment during the warmup phase
     lr_increment = (peak_lr - initial_lr) / warmup_steps
-
+    
     for epoch in range(n_epochs):
-        start_time = time.time()  # Track start time for each epoch
         model.train()
-
         for input_batch, target_batch in train_loader:
+            batch_start_time = time.time()  # Track start time for each batch
             optimizer.zero_grad()
             global_step += 1
-
-            # Adjust the learning rate based on the current phase (warmup or cosine annealing)
+            
             if global_step < warmup_steps:
-                # Linear warmup
                 lr = initial_lr + global_step * lr_increment  
             else:
-                # Cosine annealing after warmup
                 progress = ((global_step - warmup_steps) / (total_training_steps - warmup_steps))
                 lr = min_lr + (peak_lr - min_lr) * 0.5 * (1 + math.cos(math.pi * progress))
-
-            # Apply the calculated learning rate to the optimizer
+            
             for param_group in optimizer.param_groups:
                 param_group["lr"] = lr
-            track_lrs.append(lr)  # Store the current learning rate
-
-            # Calculate and backpropagate the loss
+            track_lrs.append(lr)
+            
             loss = calc_loss_batch(input_batch, target_batch, model, device)
             loss.backward()
-
-            # Apply gradient clipping after the warmup phase to avoid exploding gradients
+            
             if global_step > warmup_steps:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            
+           
             optimizer.step()
             tokens_seen += input_batch.numel()
-
-            # Calculate and display iterations per second
-            batch_time = time.time() - start_time         
-
-            # Periodically evaluate the model on the training and validation sets
+            
+            batch_time = time.time() - batch_start_time
+            steps_per_second = 1.0 / batch_time
+            
             if global_step % eval_freq == 0:
                 train_loss, val_loss = evaluate_model(
                     model, train_loader, val_loader,
                     device, eval_iter
                 )
-
                 train_losses.append(train_loss)
                 val_losses.append(val_loss)
                 track_tokens_seen.append(tokens_seen)
-
-                # Print the current losses + steps / sec
-                steps_per_second = 1.0 / batch_time
+                
                 print(f"Ep {epoch+1} (Iter {global_step:06d}): "
                       f"Train loss {train_loss:.3f}, "
                       f"Val loss {val_loss:.3f}, "
                       f"Steps/s: {steps_per_second:.2f}"
                 )
-
-            # Periodically save the model checkpoint:
+            
             if global_step > 0 and global_step % save_every == 0:
                 out_folder = "./output/"
                 torch.save(model.state_dict(), f"{out_folder}/model.pth")
                 torch.save(optimizer.state_dict(), f"{out_folder}/optimizer.pth")
-
-                # Save the config as a json file:
                 with open(f"{out_folder}/config.json", "w") as f:
                     json.dump(model.config, f)
-
                 print(f"Saved model & optimizer state dict @ step: {global_step}")
-
-        # Generate and print a sample from the model to monitor progress
+        
         generate_and_print_sample(model, tokenizer, device, start_context)
-
+    
     return train_losses, val_losses, track_tokens_seen, track_lrs
 
 def setup_tokenizer(gpt_config, checkpoint_path):
@@ -274,7 +252,7 @@ def main(gpt_config, settings, continue_training_from="", compile_model=True):
         text_data = file.read()"""
     
     # Load the data to train on from huggingface:
-    dataset = load_dataset("stas/openwebtext-10k")
+    dataset = load_dataset(settings["dataset_name"])
 
     # Access the text data (might differ depending on the dataset format)
     text_data = dataset["train"]["text"]  # Assuming the text data is in the "text" column of the training split
@@ -322,7 +300,7 @@ def main(gpt_config, settings, continue_training_from="", compile_model=True):
         model, train_loader, val_loader, optimizer, device, n_epochs=settings["num_epochs"],
         eval_freq=eval_freq, eval_iter=eval_iter, start_context="Every effort moves you",
         tokenizer=tokenizer, warmup_steps=warmup_steps, 
-        initial_lr=5e-5, min_lr=1e-5, save_every=save_every
+        initial_lr=settings["learning_rate"], min_lr=1e-5, save_every=save_every
     )
     
     endDateTime = time.time()
@@ -347,11 +325,22 @@ if __name__ == "__main__":
         "learning_rate": 5e-4,
         "num_epochs": 6,
         "batch_size": 2,
-        "weight_decay": 0.1
+        "weight_decay": 0.1,
+        "dataset_name": "stas/openwebtext-10k"
     }
 
     model_name = "bamboo-1-365M-grug"
     file_path_folder = f"./output/{model_name}"
+
+    # Check for cmd args, if any:
+    if len(sys.argv) == 4:
+        model_name = sys.argv[1]
+        OTHER_SETTINGS["num_epochs"] = int(sys.argv[2])
+        OTHER_SETTINGS["batch_size"] = int(sys.argv[3])
+        OTHER_SETTINGS["dataset_name"] = sys.argv[4]
+        print(OTHER_SETTINGS)
+    else:
+        print("Usage: model_name, num_epochs, batch_size, dataset_name")
 
     train_losses, val_losses, tokens_seen, model = main(BAMBOO_CONFIG_365M, OTHER_SETTINGS, "", False)
     epochs_tensor = torch.linspace(0, OTHER_SETTINGS["num_epochs"], len(train_losses))
