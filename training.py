@@ -354,14 +354,15 @@ if __name__ == "__main__":
     }
 
     OTHER_SETTINGS = {
-        "learning_rate": 5e-4,
-        "num_epochs": 6,
+        "learning_rate": 1e-5,
+        "num_epochs": 12,
         "batch_size": 1,
         "weight_decay": 0.1,
-        "dataset_name": "stas/openwebtext-10k"
+        #"dataset_name": "stas/openwebtext-10k"
+        "dataset_name": "./training_data/the-verdict.txt"
     }
 
-    model_name = "bamboo-1-365M-grug"
+    model_name = "bamboo-365M-grug"
     file_path_folder = f"./output/{model_name}"
 
     if len(sys.argv) == 5:
@@ -377,13 +378,16 @@ if __name__ == "__main__":
     if world_size == 0:
         print("No GPUs available. Running on CPU.")
         train_losses, val_losses, tokens_seen, model = main(0, 1, BAMBOO_CONFIG_365M, OTHER_SETTINGS, "", False)
+    elif world_size == 1:
+        print("Running on 1 GPU")
+        train_losses, val_losses, tokens_seen, model = main(0, 1, BAMBOO_CONFIG_365M, OTHER_SETTINGS, "", False)
     else:
         print(f"Running on {world_size} GPUs")
         OTHER_SETTINGS["learning_rate"] *= world_size
         print(f"Adjusted learning rate for {world_size} GPUs: {OTHER_SETTINGS['learning_rate']}")
         mp.spawn(main, args=(world_size, BAMBOO_CONFIG_365M, OTHER_SETTINGS, "", False), nprocs=world_size)
 
-    if world_size == 0 or (world_size > 0 and torch.distributed.get_rank() == 0):
+    if world_size <= 1 or (world_size > 1 and torch.distributed.get_rank() == 0):
         # Create folder if it does not exist:
         if not os.path.exists(file_path_folder):
             os.makedirs(file_path_folder)
