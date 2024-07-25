@@ -30,14 +30,19 @@ class BambooDataset(Dataset):
         return torch.load(path)
 
 
-def CreateDataloader(tokenizer, txt, batch_size=4, max_length=256, stride=128, shuffle=True, drop_last=True, num_workers=0):
+def CreateDataloader(tokenizer, txt, batch_size=4, max_length=256, stride=128, shuffle=True, drop_last=True, num_workers=0, sampler=None, pin_memory=False):
     # Initialize the tokenizer
     tokenizer = tiktoken.get_encoding(tokenizer)
-
     # Create dataset
     dataset = BambooDataset(txt, tokenizer, max_length, stride)
-
     # Create dataloader
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, drop_last=drop_last, num_workers=num_workers)
-
+    dataloader = DataLoader(
+        dataset, 
+        batch_size=batch_size, 
+        shuffle=(shuffle if sampler is None else False),
+        drop_last=drop_last, 
+        num_workers=num_workers,
+        sampler=sampler,
+        pin_memory=pin_memory
+    )
     return dataloader

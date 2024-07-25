@@ -4,21 +4,23 @@ import json
 import math
 import sys
 import time
-import numpy as np  # Add this line to import numpy
+import numpy as np
 import matplotlib
-matplotlib.use('Agg')  # Add this line to use matplotlib without a display
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from torch.cuda.amp import autocast, GradScaler
 from datasets import load_dataset
-
-#from galore_torch import GaLoreAdamW
 import os
 import torch
 import tiktoken
+import torch.multiprocessing as mp
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
+import torch.distributed as dist
 
 # Our classes:
 from architecture.gpt import GPTModel
-from architecture.dataset import CreateDataloader
+from architecture.dataset import BambooDataset, CreateDataloader
 
 def text_to_token_ids(text, tokenizer):
     encoded = tokenizer.encode(text)
@@ -31,11 +33,12 @@ def token_ids_to_text(token_ids, tokenizer):
 
 def calc_loss_batch(input_batch, target_batch, model, device):
     input_batch, target_batch = input_batch.to(device), target_batch.to(device)
-    logits = model(input_batch)
-    loss = torch.nn.functional.cross_entropy(logits.flatten(0, 1), target_batch.flatten())
+    with torch.cuda.amp.autocast(enabled=model.dtype in [torch.float16, torch.bfloat16]):
+        logits = model(input_batch)
+        loss = torch.nn.functional.cross_entropy(logits.flatten(0, 1), target_batch.flatten())
     return loss
 
-def calc_loss_loader(data_loader, model, device, num_batches=None):
+def calc_loss_loader(data_loader, model, device, dtype, num_batches=None):
     total_loss = 0.
     if len(data_loader) == 0:
         return float("nan")
@@ -43,9 +46,13 @@ def calc_loss_loader(data_loader, model, device, num_batches=None):
         num_batches = len(data_loader)
     else:
         num_batches = min(num_batches, len(data_loader))
+    
     for i, (input_batch, target_batch) in enumerate(data_loader):
         if i < num_batches:
-            loss = calc_loss_batch(input_batch, target_batch, model, device)
+            input_batch, target_batch = input_batch.to(device), target_batch.to(device)
+            with torch.cuda.amp.autocast(enabled=dtype != torch.float32, dtype=dtype):
+                logits = model(input_batch)
+                loss = torch.nn.functional.cross_entropy(logits.flatten(0, 1), target_batch.flatten())
             total_loss += loss.item()
         else:
             break
@@ -72,116 +79,109 @@ def generate_and_print_sample(model, tokenizer, device, start_context):
 
 def plot_losses(epochs_seen, tokens_seen, train_losses, val_losses):
     fig, ax1 = plt.subplots()
-    # Plot training and validation loss against epochs (primary y-axis)
     ax1.plot(epochs_seen, train_losses, label="Training loss", marker='o')
     ax1.plot(epochs_seen, val_losses, linestyle="-.", label="Validation loss", marker='x')
     ax1.set_xlabel("Epochs")
     ax1.set_ylabel("Loss")
     ax1.legend(loc="upper right")
 
-    # Create a second x-axis for tokens seen
-    ax2 = ax1.twiny()  # Share the y-axis
-    ax2.plot(tokens_seen, train_losses, alpha=0)  # Invisible plot to align ticks
+    ax2 = ax1.twiny()
+    ax2.plot(tokens_seen, train_losses, alpha=0)
     ax2.set_xlabel("Tokens seen")
     fig.tight_layout()
 
-def train_model_simple(model, train_loader, val_loader, optimizer, device, num_epochs, eval_freq, eval_iter, start_context, tokenizer):
-    # Initialize lists to track losses and tokens seen
-    train_losses, val_losses, track_tokens_seen = [], [], []
-    tokens_seen, global_step = 0, -1
-
-    # Main training loop
-    for epoch in range(num_epochs):
-        model.train()  # Set model to training mode
-        
-        for input_batch, target_batch in train_loader:
-            optimizer.zero_grad() # Reset loss gradients from previous batch iteration
-            loss = calc_loss_batch(input_batch, target_batch, model, device)
-            loss.backward() # Calculate loss gradients
-            optimizer.step() # Update model weights using loss gradients
-            tokens_seen += input_batch.numel()
-            global_step += 1
-
-            # Optional evaluation step
-            if global_step % eval_freq == 0:
-                train_loss, val_loss = evaluate_model(
-                    model, train_loader, val_loader, device, eval_iter)
-                train_losses.append(train_loss)
-                val_losses.append(val_loss)
-                track_tokens_seen.append(tokens_seen)
-                print(f"Ep {epoch+1} (Step {global_step:06d}): "
-                      f"Train loss {train_loss:.3f}, Val loss {val_loss:.3f}")
-
-        # Print a sample text after each epoch
-        generate_and_print_sample(
-            model, tokenizer, device, start_context
-        )
-
-    return train_losses, val_losses, track_tokens_seen
-
-def train_model(model, train_loader, val_loader, optimizer, device,
+def train_model(model, train_loader, val_loader, optimizer, device, dtype,
                 n_epochs, eval_freq, eval_iter, start_context, tokenizer,
-                warmup_steps, initial_lr=3e-05, min_lr=1e-6, save_every=500):
+                warmup_steps, initial_lr=3e-05, min_lr=1e-6, save_every=500, world_size=1, rank=0):
+
     train_losses, val_losses, track_tokens_seen, track_lrs = [], [], [], []
     tokens_seen, global_step = 0, -1
+
     peak_lr = optimizer.param_groups[0]["lr"]
     total_training_steps = len(train_loader) * n_epochs
     lr_increment = (peak_lr - initial_lr) / warmup_steps
-    
+
+    # Use GradScaler only for float16
+    use_scaler = dtype == torch.float16
+    scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)
+
     for epoch in range(n_epochs):
+        start_time = time.time()
         model.train()
+
+        if world_size > 1:
+            train_loader.sampler.set_epoch(epoch)
+            val_loader.sampler.set_epoch(epoch)
+
         for input_batch, target_batch in train_loader:
-            batch_start_time = time.time()  # Track start time for each batch
             optimizer.zero_grad()
             global_step += 1
-            
+
             if global_step < warmup_steps:
                 lr = initial_lr + global_step * lr_increment  
             else:
                 progress = ((global_step - warmup_steps) / (total_training_steps - warmup_steps))
                 lr = min_lr + (peak_lr - min_lr) * 0.5 * (1 + math.cos(math.pi * progress))
-            
+
             for param_group in optimizer.param_groups:
                 param_group["lr"] = lr
             track_lrs.append(lr)
-            
-            loss = calc_loss_batch(input_batch, target_batch, model, device)
-            loss.backward()
-            
-            if global_step > warmup_steps:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-           
-            optimizer.step()
+
+            input_batch, target_batch = input_batch.to(device), target_batch.to(device)
+
+            with torch.cuda.amp.autocast(enabled=dtype != torch.float32, dtype=dtype):
+                logits = model(input_batch)
+                loss = torch.nn.functional.cross_entropy(logits.flatten(0, 1), target_batch.flatten())
+
+            if use_scaler:
+                scaler.scale(loss).backward()
+                if global_step > warmup_steps:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                if global_step > warmup_steps:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+
             tokens_seen += input_batch.numel()
-            
-            batch_time = time.time() - batch_start_time
-            steps_per_second = 1.0 / batch_time
-            
+
+            batch_time = time.time() - start_time         
+
             if global_step % eval_freq == 0:
-                train_loss, val_loss = evaluate_model(
-                    model, train_loader, val_loader,
-                    device, eval_iter
-                )
+                model.eval()
+                with torch.no_grad():
+                    train_loss = calc_loss_loader(train_loader, model, device, dtype, num_batches=eval_iter)
+                    val_loss = calc_loss_loader(val_loader, model, device, dtype, num_batches=eval_iter)
+                model.train()
+
                 train_losses.append(train_loss)
                 val_losses.append(val_loss)
                 track_tokens_seen.append(tokens_seen)
-                
-                print(f"Ep {epoch+1} (Iter {global_step:06d}): "
-                      f"Train loss {train_loss:.3f}, "
-                      f"Val loss {val_loss:.3f}, "
-                      f"Steps/s: {steps_per_second:.2f}"
-                )
-            
-            if global_step > 0 and global_step % save_every == 0:
+
+                steps_per_second = 1.0 / batch_time
+                if rank == 0:
+                    print(f"Ep {epoch+1} (Iter {global_step:06d}): "
+                          f"Train loss {train_loss:.3f}, "
+                          f"Val loss {val_loss:.3f}, "
+                          f"Steps/s: {steps_per_second:.2f}"
+                    )
+
+            if global_step > 0 and global_step % save_every == 0 and rank == 0:
                 out_folder = "./output/"
-                torch.save(model.state_dict(), f"{out_folder}/model.pth")
+                torch.save(model.module.state_dict() if isinstance(model, DDP) else model.state_dict(), f"{out_folder}/model.pth")
                 torch.save(optimizer.state_dict(), f"{out_folder}/optimizer.pth")
+
                 with open(f"{out_folder}/config.json", "w") as f:
-                    json.dump(model.config, f)
+                    json.dump(model.module.config if isinstance(model, DDP) else model.config, f)
+
                 print(f"Saved model & optimizer state dict @ step: {global_step}")
-        
-        generate_and_print_sample(model, tokenizer, device, start_context)
-    
+
+        if rank == 0:
+            generate_and_print_sample(model.module if isinstance(model, DDP) else model, tokenizer, device, start_context)
+
     return train_losses, val_losses, track_tokens_seen, track_lrs
 
 def setup_tokenizer(gpt_config, checkpoint_path):
@@ -191,14 +191,14 @@ def setup_tokenizer(gpt_config, checkpoint_path):
         with open(config_file, "r") as f:
             checkpoint_config = json.load(f)
         tokenizer = tiktoken.get_encoding(checkpoint_config["tokenizer"])
-        gpt_config = checkpoint_config  # Use the checkpoint's config
+        gpt_config = checkpoint_config
     else:
         tokenizer = tiktoken.get_encoding(gpt_config["tokenizer"])
     
     gpt_config["vocab_size"] = tokenizer.n_vocab
     return tokenizer, gpt_config
 
-def load_or_initialize_model(gpt_config, settings, continue_training_from, device, compile_model):
+def load_or_initialize_model(gpt_config, settings, continue_training_from, device, compile_model, rank, world_size):
     if continue_training_from:
         print("Continuing training from a previous checkpoint...")
         model = GPTModel(gpt_config)
@@ -208,28 +208,34 @@ def load_or_initialize_model(gpt_config, settings, continue_training_from, devic
         print("Initializing new model...")
         model = GPTModel(gpt_config)
 
-    # Common model setup
-    if device.type == "cuda" and torch.cuda.get_device_capability()[0] >= 8:
-        print("Converting model to bfloat16...")
-        model.to(device=device, dtype=torch.bfloat16)
-        model.pos_emb.to(device, dtype=torch.bfloat16)
-    elif device.type == "cuda" and torch.cuda.get_device_capability()[0] > 4:
-        print("Converting model to float16...")
-        model.to(device=device, dtype=torch.float16)
-        model.pos_emb.to(device, dtype=torch.float16)
+    # Determine the appropriate dtype
+    if device.type == "cuda":
+        if torch.cuda.get_device_capability()[0] >= 8:
+            print("Converting model to bfloat16...")
+            dtype = torch.bfloat16
+        elif torch.cuda.get_device_capability()[0] >= 6:
+            print("Converting model to float16...")
+            dtype = torch.float16
+        else:
+            print("Using default float32...")
+            dtype = torch.float32
     else:
-        model.to(device)
-        model.pos_emb.to(device)
+        dtype = torch.float32
+
+    model = model.to(device=device, dtype=dtype)
+
+    if world_size > 1:
+        model = DDP(model, device_ids=[rank])
 
     if compile_model and not continue_training_from:
         model = compile_model_based_on_os(model)
 
-    optimizer = torch.optim.AdamW(model.parameters(), weight_decay=settings["weight_decay"])
+    optimizer = torch.optim.AdamW(model.parameters(), lr=settings["learning_rate"], weight_decay=settings["weight_decay"])
     
     if continue_training_from:
         optimizer.load_state_dict(torch.load(f"{continue_training_from}/optimizer.pth", map_location=device))
 
-    return model, optimizer
+    return model, optimizer, dtype
 
 def compile_model_based_on_os(model):
     print("Compiling model...")
@@ -241,29 +247,47 @@ def compile_model_based_on_os(model):
         model = thunder.jit(model)
     return model
 
-def main(gpt_config, settings, continue_training_from="", compile_model=True):
+def setup(rank, world_size):
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '12355'
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+
+def cleanup():
+    dist.destroy_process_group()
+
+def get_available_gpus():
+    return torch.cuda.device_count()
+
+def main(rank, world_size, gpt_config, settings, continue_training_from="", compile_model=True):
+    if world_size > 1:
+        setup(rank, world_size)
+        device = torch.device(f"cuda:{rank}")
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     torch.manual_seed(123)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using the {'GPU! 🔥' if device.type == 'cuda' else 'CPU! ❄️'}")
+    if rank == 0:
+        print(f"Using {'GPU! 🔥' if device.type == 'cuda' else 'CPU! ❄️'}")
 
-    # Old-style data loading from a local file, uncomment if you want to use it:
-    """file_path = "./training_data/grug.txt"
-    with open(file_path, "r", encoding="utf-8") as file:
-        text_data = file.read()"""
-    
-    # Load the data to train on from huggingface:
     dataset = load_dataset(settings["dataset_name"])
-
-    # Access the text data (might differ depending on the dataset format)
-    text_data = dataset["train"]["text"]  # Assuming the text data is in the "text" column of the training split
-    text_data = "\n".join(text_data) # Flatten text to a single string for us to split up later.
+    text_data = dataset["train"]["text"]
+    text_data = "\n".join(text_data)
 
     tokenizer, gpt_config = setup_tokenizer(gpt_config, continue_training_from)
-    model, optimizer = load_or_initialize_model(gpt_config, settings, continue_training_from, device, compile_model)
+    model, optimizer, dtype = load_or_initialize_model(gpt_config, settings, continue_training_from, device, compile_model, rank, world_size)
 
-    print("Setting up dataloaders...")
+    if rank == 0:
+        print("Setting up dataloaders...")
     train_ratio = 0.90
     split_idx = int(train_ratio * len(text_data))
+
+    if world_size > 1:
+        train_sampler = DistributedSampler(BambooDataset(text_data[:split_idx], tokenizer, gpt_config["context_length"], gpt_config["context_length"]))
+        val_sampler = DistributedSampler(BambooDataset(text_data[split_idx:], tokenizer, gpt_config["context_length"], gpt_config["context_length"]))
+    else:
+        train_sampler = None
+        val_sampler = None
+
     train_loader = CreateDataloader(
         gpt_config["tokenizer"],
         text_data[:split_idx],
@@ -271,8 +295,10 @@ def main(gpt_config, settings, continue_training_from="", compile_model=True):
         max_length=gpt_config["context_length"],
         stride=gpt_config["context_length"],
         drop_last=True,
-        shuffle=True,
-        num_workers=0
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
+        num_workers=4,
+        pin_memory=True
     )
     val_loader = CreateDataloader(
         gpt_config["tokenizer"],
@@ -282,49 +308,55 @@ def main(gpt_config, settings, continue_training_from="", compile_model=True):
         stride=gpt_config["context_length"],
         drop_last=False,
         shuffle=False,
-        num_workers=0
+        sampler=val_sampler,
+        num_workers=4,
+        pin_memory=True
     )
 
-    print("Training model...")
+    if rank == 0:
+        print("Training model...")
     startDateTime = time.time()
     total_steps = len(train_loader) * settings["num_epochs"]
-    warmup_steps = int(0.2 * total_steps)
+    warmup_steps = max(1, int(0.2 * total_steps))
     eval_freq = 5
     eval_iter = 1
     save_every = 500
 
-    if warmup_steps == 0:
-        warmup_steps = 1
-    
     train_losses, val_losses, tokens_seen, lrs = train_model(
-        model, train_loader, val_loader, optimizer, device, n_epochs=settings["num_epochs"],
+        model, train_loader, val_loader, optimizer, device, dtype,
+        n_epochs=settings["num_epochs"],
         eval_freq=eval_freq, eval_iter=eval_iter, start_context="Every effort moves you",
         tokenizer=tokenizer, warmup_steps=warmup_steps, 
-        initial_lr=settings["learning_rate"], min_lr=1e-5, save_every=save_every
+        initial_lr=settings["learning_rate"], min_lr=1e-5, save_every=save_every,
+        world_size=world_size, rank=rank
     )
     
     endDateTime = time.time()
     timeTaken = endDateTime - startDateTime
-    print(f"Time taken: {timeTaken}")
+    if rank == 0:
+        print(f"Time taken: {timeTaken}")
+
+    if world_size > 1:
+        cleanup()
+
     return train_losses, val_losses, tokens_seen, model
 
 if __name__ == "__main__":
-
     BAMBOO_CONFIG_365M = {
-        "tokenizer": "o200k_base", # Tokenizer to use, default GPT-4o tokenizer
-        "context_length": 1536,  # Shortened context length (orig: 1024)
-        "emb_dim": 768,         # Embedding dimension
-        "n_heads": 12,          # Number of attention heads
-        "n_layers": 8,         # Number of layers
-        "drop_rate": 0.0,       # Dropout rate, disabled since it's no longer recommended for LLMs
-        "qkv_bias": False,       # Query-key-value bias,
-        "window_size": 1024      # Window size for sliding window attention
+        "tokenizer": "o200k_base",
+        "context_length": 1536,
+        "emb_dim": 768,
+        "n_heads": 12,
+        "n_layers": 8,
+        "drop_rate": 0.0,
+        "qkv_bias": False,
+        "window_size": 1024
     }
 
     OTHER_SETTINGS = {
         "learning_rate": 5e-4,
         "num_epochs": 6,
-        "batch_size": 2,
+        "batch_size": 1,
         "weight_decay": 0.1,
         "dataset_name": "stas/openwebtext-10k"
     }
@@ -332,8 +364,7 @@ if __name__ == "__main__":
     model_name = "bamboo-1-365M-grug"
     file_path_folder = f"./output/{model_name}"
 
-    # Check for cmd args, if any:
-    if len(sys.argv) == 4:
+    if len(sys.argv) == 5:
         model_name = sys.argv[1]
         OTHER_SETTINGS["num_epochs"] = int(sys.argv[2])
         OTHER_SETTINGS["batch_size"] = int(sys.argv[3])
@@ -342,18 +373,34 @@ if __name__ == "__main__":
     else:
         print("Usage: model_name, num_epochs, batch_size, dataset_name")
 
-    train_losses, val_losses, tokens_seen, model = main(BAMBOO_CONFIG_365M, OTHER_SETTINGS, "", False)
-    epochs_tensor = torch.linspace(0, OTHER_SETTINGS["num_epochs"], len(train_losses))
-    plot_losses(epochs_tensor, tokens_seen, train_losses, val_losses)
-    plt.savefig(f"{file_path_folder}/loss.jpg")
+    world_size = get_available_gpus()
+    if world_size == 0:
+        print("No GPUs available. Running on CPU.")
+        train_losses, val_losses, tokens_seen, model = main(0, 1, BAMBOO_CONFIG_365M, OTHER_SETTINGS, "", False)
+    else:
+        print(f"Running on {world_size} GPUs")
+        OTHER_SETTINGS["learning_rate"] *= world_size
+        print(f"Adjusted learning rate for {world_size} GPUs: {OTHER_SETTINGS['learning_rate']}")
+        mp.spawn(main, args=(world_size, BAMBOO_CONFIG_365M, OTHER_SETTINGS, "", False), nprocs=world_size)
 
-    # Create folder if it does not exist:
-    if not os.path.exists(file_path_folder):
-        os.makedirs(file_path_folder)
+    if world_size == 0 or (world_size > 0 and torch.distributed.get_rank() == 0):
+        # Create folder if it does not exist:
+        if not os.path.exists(file_path_folder):
+            os.makedirs(file_path_folder)
 
-    # Save the model:
-    torch.save(model.state_dict(), f"{file_path_folder}/model.pth")
+        # Plot and save losses
+        epochs_tensor = torch.linspace(0, OTHER_SETTINGS["num_epochs"], len(train_losses))
+        plot_losses(epochs_tensor, tokens_seen, train_losses, val_losses)
+        plt.savefig(f"{file_path_folder}/loss.jpg")
 
-    # Save the config as a json file:
-    with open(f"{file_path_folder}/config.json", "w") as f:
-        json.dump(BAMBOO_CONFIG_365M, f)
+        # Save the model:
+        if isinstance(model, DDP):
+            torch.save(model.module.state_dict(), f"{file_path_folder}/model.pth")
+        else:
+            torch.save(model.state_dict(), f"{file_path_folder}/model.pth")
+
+        # Save the config as a json file:
+        with open(f"{file_path_folder}/config.json", "w") as f:
+            json.dump(BAMBOO_CONFIG_365M, f)
+
+        print(f"Model, losses, and config saved in {file_path_folder}")
